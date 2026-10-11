@@ -16,7 +16,7 @@ Each build is a GitHub release with `image.tar.zst` and `record.json`, and a bui
 
     gh attestation verify image.tar.zst --repo taoloop/runner-images
     zstd -dc image.tar.zst | docker load
-    docker image inspect --format '{{.Id}}' <loaded tag>   # equals record.json image_id
+    docker image inspect --format '{{.Id}}' <loaded tag>   # equals record.json image_id on Docker's containerd image store (config_digest on the classic store)
 
 ## Third-party content
 

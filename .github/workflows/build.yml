@@ -52,11 +52,17 @@ jobs:
       - name: Record
         env: { BUILD_ID: "${{ inputs.build_id }}", KIND: "${{ inputs.kind }}", COMMIT: "${{ inputs.commit }}" }
         run: |
-          id=$(docker image inspect --format '{{.Id}}' "taoloop-$KIND:build")
+          # image_id is the archive's manifest digest: the id hosts on Docker's containerd image
+          # store report after `docker load` and run by. The config digest is kept beside it.
+          config=$(docker image inspect --format '{{.Id}}' "taoloop-$KIND:build")
+          zstd -dc image.tar.zst | tar xO index.json > index.json
+          [ "$(jq '.manifests | length' index.json)" = 1 ] || { echo "archive must hold one manifest" >&2; exit 1; }
+          id=$(jq -r '.manifests[0].digest' index.json)
+          [[ $id =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "bad manifest digest" >&2; exit 1; }
           sha=$(sha256sum image.tar.zst | cut -d' ' -f1)
           size=$(stat -c %s image.tar.zst)
-          jq -n --arg b "$BUILD_ID" --arg k "$KIND" --arg c "$COMMIT" --arg i "$id" --arg s "$sha" --argjson n "$size" \
-            '{build_id:$b, kind:$k, commit:$c, image_id:$i, archive_sha256:$s, archive_bytes:$n, bundles_agents:false}' > record.json
+          jq -n --arg b "$BUILD_ID" --arg k "$KIND" --arg c "$COMMIT" --arg i "$id" --arg g "$config" --arg s "$sha" --argjson n "$size" \
+            '{build_id:$b, kind:$k, commit:$c, image_id:$i, config_digest:$g, archive_sha256:$s, archive_bytes:$n, bundles_agents:false}' > record.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: image
