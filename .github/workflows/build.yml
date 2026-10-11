@@ -1,0 +1,82 @@
+name: build
+run-name: build ${{ inputs.build_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      build_id: { description: TaoLoop build id, required: true, type: string }
+      kind: { description: Image kind, required: true, type: choice, options: [coder, harness, miner_server] }
+      commit: { description: Commit to build, required: true, type: string }
+      tag: { description: "Release tag: <kind>-<YYYYMMDD>-<commit7>-<build8>", required: true, type: string }
+permissions: {}
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions: { contents: read }
+    steps:
+      - name: Check inputs
+        shell: bash
+        env:
+          BUILD_ID: "${{ inputs.build_id }}"
+          COMMIT: "${{ inputs.commit }}"
+          KIND: "${{ inputs.kind }}"
+          TAG: "${{ inputs.tag }}"
+        run: |
+          [[ $BUILD_ID =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || { echo "bad build_id" >&2; exit 1; }
+          [[ $COMMIT =~ ^[0-9a-f]{40}$ ]] || { echo "bad commit" >&2; exit 1; }
+          [[ $TAG =~ ^[a-z_]+-[0-9]{8}-[0-9a-f]{7}-[0-9a-f]{8}$ ]] || { echo "bad tag" >&2; exit 1; }
+          [[ $TAG == "${KIND}-"* ]] || { echo "tag must start with ${KIND}-" >&2; exit 1; }
+          [[ ${TAG#"${KIND}-"} =~ ^[0-9]{8}-([0-9a-f]{7})-([0-9a-f]{8})$ ]] || { echo "bad tag" >&2; exit 1; }
+          [[ ${BASH_REMATCH[1]} == "${COMMIT:0:7}" ]] || { echo "tag commit must be ${COMMIT:0:7}" >&2; exit 1; }
+          [[ ${BASH_REMATCH[2]} == "${BUILD_ID:0:8}" ]] || { echo "tag build must be ${BUILD_ID:0:8}" >&2; exit 1; }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with: { ref: "${{ inputs.commit }}", fetch-depth: 0, persist-credentials: false }
+      - name: Require merged code
+        shell: bash
+        env: { COMMIT: "${{ inputs.commit }}" }
+        run: |
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$COMMIT" origin/main || { echo "commit is not on main" >&2; exit 1; }
+      - name: Build
+        env: { KIND: "${{ inputs.kind }}" }
+        run: |
+          case "$KIND" in
+            coder) file=Codex.Dockerfile ;;
+            harness) file=Harness.Dockerfile ;;
+            miner_server) file=MinerServer.Dockerfile ;;
+          esac
+          docker build --pull -f "$file" -t "taoloop-$KIND:build" .
+          docker save "taoloop-$KIND:build" | zstd -19 -T0 -o image.tar.zst
+          size=$(stat -c %s image.tar.zst)
+          [ "$size" -lt 2147483648 ] || { echo "archive must be under 2 GiB" >&2; exit 1; }
+      - name: Record
+        env: { BUILD_ID: "${{ inputs.build_id }}", KIND: "${{ inputs.kind }}", COMMIT: "${{ inputs.commit }}" }
+        run: |
+          id=$(docker image inspect --format '{{.Id}}' "taoloop-$KIND:build")
+          sha=$(sha256sum image.tar.zst | cut -d' ' -f1)
+          size=$(stat -c %s image.tar.zst)
+          jq -n --arg b "$BUILD_ID" --arg k "$KIND" --arg c "$COMMIT" --arg i "$id" --arg s "$sha" --argjson n "$size" \
+            '{build_id:$b, kind:$k, commit:$c, image_id:$i, archive_sha256:$s, archive_bytes:$n, bundles_agents:false}' > record.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: image
+          path: |
+            image.tar.zst
+            record.json
+          retention-days: 1
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions: { contents: write, attestations: write, id-token: write }
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with: { name: image }
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: |
+            image.tar.zst
+            record.json
+      - name: Release
+        env: { GH_TOKEN: "${{ github.token }}", TAG: "${{ inputs.tag }}", COMMIT: "${{ inputs.commit }}", REPO: "${{ github.repository }}" }
+        run: gh release create "$TAG" image.tar.zst record.json --repo "$REPO" --target "$COMMIT" --title "$TAG" --notes "TaoLoop runner image build"
