@@ -308,6 +308,8 @@ MODEL_ALIAS: tuple[str, str] | None = None
 MODEL_ALIASES: dict[str, str] = {}
 # The relay policy model ids the driver may forward; relay membership remains authoritative.
 ALLOWED_MODELS: set[str] = set()
+# Ordered model ids from the server capability, primary first.
+MODEL_POOL: tuple[str, ...] = ()
 # The relay policy's default model id for this task; set once in main().
 TASK_MODEL = ""
 
@@ -337,7 +339,7 @@ AGENT_PATH = "/usr/local/bin:" + os.defpath
 
 def configure_model_pool(encoded, primary):
     """Decode only the server-frozen model ids supplied by the trusted runner."""
-    global MODEL_ALIASES, ALLOWED_MODELS
+    global MODEL_ALIASES, ALLOWED_MODELS, MODEL_POOL
     if not encoded:
         values = [primary]
     else:
@@ -357,6 +359,7 @@ def configure_model_pool(encoded, primary):
     if primary not in values:
         raise SystemExit("Model pool does not include the task model")
     ALLOWED_MODELS = set(values)
+    MODEL_POOL = tuple(values)
     aliases = {}
     for value in values:
         bare = value.rsplit("/", 1)[-1]
@@ -365,6 +368,57 @@ def configure_model_pool(encoded, primary):
         else:
             aliases[bare] = value
     MODEL_ALIASES = {bare: value for bare, value in aliases.items() if value}
+
+
+def apply_codex_role_definitions(home):
+    """Install the task-local Codex roles from the frozen capability pool.
+
+    Codex discovers TOML role files natively. The lifecycle skill remains the shared
+    Markdown source of BDD/TDD guidance; these narrow role files only say which part of
+    that lifecycle each child owns. Owners can steer delegation in the task prompt, but
+    the bridge and relay remain the model-authorization boundary.
+    """
+    if not MODEL_POOL:
+        return
+    choices = [
+        bare if MODEL_ALIASES.get(bare) == model else model
+        for model in MODEL_POOL
+        for bare in (model.rsplit("/", 1)[-1],)
+    ]
+    roles = (
+        (
+            "taoloop_explorer",
+            choices[min(1, len(choices) - 1)],
+            "Read-only explorer. Map relevant code and tests, identify acceptance scenarios, and return concise evidence. Do not edit files.",
+        ),
+        (
+            "taoloop_implementer",
+            choices[0],
+            "Implementation agent. Follow the task's BDD/TDD lifecycle: make a focused failing test, implement the smallest change, then refactor only after it passes.",
+        ),
+        (
+            "taoloop_reviewer",
+            choices[min(2, len(choices) - 1)],
+            "Independent reviewer. Check correctness, security, regressions, and missing tests. Report concrete findings with files and reproduction steps; do not edit files.",
+        ),
+    )
+    directory = Path(home) / ".codex" / "agents"
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    for name, model, instructions in roles:
+        content = "\n".join(
+            (
+                "name = " + json.dumps(name),
+                "description = " + json.dumps(instructions.split(". ", 1)[0] + "."),
+                "model = " + json.dumps(model),
+                "developer_instructions = " + json.dumps(instructions),
+                "",
+            )
+        )
+        descriptor = os.open(
+            directory / (name + ".toml"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+        )
+        with os.fdopen(descriptor, "w") as target:
+            target.write(content)
 
 
 def agent_env(home):
@@ -755,6 +809,9 @@ def run_codex(args, home, port, toolkit, context, resume=None, prompt=None):
             "model_providers.taoloop.request_max_retries": 0,
             "model_providers.taoloop.stream_max_retries": 0,
         }
+    if args.auth != "subscription":
+        apply_codex_role_definitions(home)
+        config["agents.enabled"] = True
     command = ["/usr/local/bin/codex"]
     for key, value in config.items():
         command.extend(["-c", key + "=" + json.dumps(value)])
