@@ -389,7 +389,12 @@ def apply_codex_role_definitions(home):
         (
             "taoloop_explorer",
             choices[min(1, len(choices) - 1)],
-            "Read-only explorer. Map relevant code and tests, identify acceptance scenarios, and return concise evidence. Do not edit files.",
+            "Behaviour and specification agent. Read relevant code and tests, turn the task into observable acceptance scenarios, identify affected boundaries, and return concise evidence. Do not edit files.",
+        ),
+        (
+            "taoloop_test_author",
+            choices[min(1, len(choices) - 1)],
+            "Test author. After the coordinator accepts the scenarios, add or identify focused BDD/TDD regression tests that fail for the current behaviour. Do not edit implementation files, weaken assertions, or make the production change.",
         ),
         (
             "taoloop_implementer",
