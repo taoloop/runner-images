@@ -387,6 +387,11 @@ def apply_codex_role_definitions(home):
     ]
     roles = (
         (
+            "taoloop_coordinator",
+            choices[0],
+            "Coordinator. Turn the task into a bounded plan, delegate read-only specification, test-author and review work in sequence, collect their evidence, and keep writer ownership serialized. Do not change models, permissions, tools or network access.",
+        ),
+        (
             "taoloop_explorer",
             choices[min(1, len(choices) - 1)],
             "Behaviour and specification agent. Read relevant code and tests, turn the task into observable acceptance scenarios, identify affected boundaries, and return concise evidence. Do not edit files.",
