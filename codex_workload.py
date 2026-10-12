@@ -206,16 +206,24 @@ class Bridge(BaseHTTPRequestHandler):
                     if isinstance(payload, dict) and payload.get("model") != TASK_MODEL:
                         payload["model"] = TASK_MODEL
                         body = json.dumps(payload).encode()
-                elif MODEL_ALIAS is not None:
-                    # Codex knows the model by its bare name; the relay policy by the
-                    # provider-prefixed id. Only that one field is rewritten.
+                else:
+                    # Codex commonly uses bare model names while the relay uses canonical
+                    # provider-prefixed ids. Normalize only names in this task's frozen pool;
+                    # both this bridge and the relay refuse anything outside it.
                     try:
                         payload = json.loads(body)
                     except ValueError:
                         payload = None
-                    if isinstance(payload, dict) and payload.get("model") == MODEL_ALIAS[0]:
-                        payload["model"] = MODEL_ALIAS[1]
-                        body = json.dumps(payload).encode()
+                    if not isinstance(payload, dict):
+                        self.send_error(400, "Invalid model request")
+                        return
+                    requested = payload.get("model")
+                    canonical = MODEL_ALIASES.get(requested, requested)
+                    if not isinstance(canonical, str) or canonical not in ALLOWED_MODELS:
+                        self.send_error(403, "Task model is not authorized")
+                        return
+                    payload["model"] = canonical
+                    body = json.dumps(payload).encode()
             else:
                 if fetch or push:
                     service = "git-receive-pack" if push else "git-upload-pack"
@@ -296,10 +304,15 @@ UNFORWARDED = {
 }
 # (name Codex is configured with, name the relay policy expects); set once in main().
 MODEL_ALIAS: tuple[str, str] | None = None
-# The relay policy's model id for this task; set once in main().
+# Every bare Codex model name that is unambiguous within the frozen task pool.
+MODEL_ALIASES: dict[str, str] = {}
+# The relay policy model ids the driver may forward; relay membership remains authoritative.
+ALLOWED_MODELS: set[str] = set()
+# The relay policy's default model id for this task; set once in main().
 TASK_MODEL = ""
 
 NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
+MODEL_ID = re.compile(r"^[A-Za-z0-9_.-]{1,64}(?:/[A-Za-z0-9_.:-]{1,64})?$")
 COMMAND_PATTERN = re.compile(r"^(?:[A-Za-z0-9_.-]{1,64}|/usr/local/bin/[A-Za-z0-9_.-]{1,64})$")
 TOOLKIT_MAX_BYTES = 131_072
 CONTEXT_MAX_BYTES = 65_536
@@ -320,6 +333,38 @@ HELD_NAMES = {
 HELD_PATHS = {".github/copilot-instructions.md"}
 # The image's Python lives in /usr/local/bin; agents run the candidate's code with it.
 AGENT_PATH = "/usr/local/bin:" + os.defpath
+
+
+def configure_model_pool(encoded, primary):
+    """Decode only the server-frozen model ids supplied by the trusted runner."""
+    global MODEL_ALIASES, ALLOWED_MODELS
+    if not encoded:
+        values = [primary]
+    else:
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+            values = json.loads(raw)
+        except (ValueError, UnicodeError):
+            raise SystemExit("Invalid model pool") from None
+        if (
+            len(raw) > 16384
+            or not isinstance(values, list)
+            or not 1 <= len(values) <= 64
+            or any(not isinstance(value, str) or not MODEL_ID.fullmatch(value) for value in values)
+            or len(set(values)) != len(values)
+        ):
+            raise SystemExit("Invalid model pool")
+    if primary not in values:
+        raise SystemExit("Model pool does not include the task model")
+    ALLOWED_MODELS = set(values)
+    aliases = {}
+    for value in values:
+        bare = value.rsplit("/", 1)[-1]
+        if bare in aliases:
+            aliases[bare] = ""
+        else:
+            aliases[bare] = value
+    MODEL_ALIASES = {bare: value for bare, value in aliases.items() if value}
 
 
 def agent_env(home):
@@ -1301,6 +1346,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-commit", required=True)
     parser.add_argument("--model", required=True)
+    # Base64 JSON of the immutable server-issued allowed model ids; never user prompt text.
+    parser.add_argument("--model-pool", default="")
     parser.add_argument("--objective", required=True)
     parser.add_argument("--user-id", required=True)
     parser.add_argument("--network", required=True)
@@ -1335,6 +1382,7 @@ def main():
     # before the step ends.
     parser.add_argument("--candidate-bound", default="")
     args = parser.parse_args()
+    configure_model_pool(args.model_pool, args.model)
     if args.candidate_bound and (
         not CANDIDATE_PATH.fullmatch(args.candidate_bound)
         or any(part in {"", ".", "..", ".git"} for part in args.candidate_bound.split("/"))
