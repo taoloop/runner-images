@@ -20,6 +20,21 @@ class HistoryError(Exception):
     pass
 
 
+# .taoloop/ is runner-private except a subnet starter's manifest and agent definitions
+# (ADR 021), which a coding task must be able to publish.
+PUBLISHED = re.compile(r"\.taoloop/(?:starter\.json|agents/[A-Za-z0-9_-]{1,64}\.md)")
+
+
+def published_entry(path, entry):
+    """Inside .taoloop/: the entries to publish (True), to descend into (None for the agents
+    folder) or to leave private (False). A linked published path is refused."""
+    if path == ".taoloop/agents":
+        if entry.is_symlink():
+            raise HistoryError("Unsafe candidate path")
+        return None if entry.is_dir(follow_symlinks=False) else False
+    return bool(PUBLISHED.fullmatch(path))
+
+
 def candidate_files(root):
     total = 0
     count = 0
@@ -27,13 +42,25 @@ def candidate_files(root):
     while pending:
         directory, prefix = pending.pop()
         for entry in sorted(os.scandir(directory), key=lambda entry: entry.name):
-            if not prefix and entry.name in {".git", ".taoloop"}:
+            if not prefix and entry.name == ".git":
+                continue
+            if not prefix and entry.name == ".taoloop":
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append((Path(entry.path), ".taoloop/"))
                 continue
             path = prefix + entry.name
+            if prefix.startswith(".taoloop/"):
+                decision = published_entry(path, entry)
+                if decision is None:
+                    pending.append((Path(entry.path), path + "/"))
+                    continue
+                if not decision:
+                    continue
             parts = Path(path).parts
             if (
                 any(
-                    part in {".git", ".taoloop", ".env"} or part.startswith(".env.")
+                    (part in {".git", ".taoloop", ".env"} and not PUBLISHED.fullmatch(path))
+                    or part.startswith(".env.")
                     for part in parts
                 )
                 or "\\" in path
