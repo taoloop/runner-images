@@ -1152,10 +1152,18 @@ RUNNABILITY_LEVELS = ("build", "self_check", "offline_loop", "local_chain")
 EMPTY_DIGEST = hashlib.sha256(b"").hexdigest()
 
 
+# A line version's evaluate prints its score on its last stdout line (ADR 023 Phase 7).
+SCORE_TAIL = 16384
+ENV_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
+METRIC_NAME = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
+COMMAND_ARGUMENT = 1024
+
+
 class BoundedCapture:
-    def __init__(self):
+    def __init__(self, keep=2000):
         self.digest = hashlib.sha256()
         self.tail = bytearray()
+        self.keep = keep
         self.lock = threading.Lock()
 
     def consume(self, stream):
@@ -1163,8 +1171,14 @@ class BoundedCapture:
             with self.lock:
                 self.digest.update(chunk)
                 self.tail.extend(chunk)
-                if len(self.tail) > 2000:
-                    del self.tail[:-2000]
+                if len(self.tail) > self.keep:
+                    del self.tail[: -self.keep]
+
+    def last_line(self):
+        with self.lock:
+            text = bytes(self.tail).decode("utf-8", "replace")
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        return lines[-1] if lines else ""
 
     def excerpt(self):
         with self.lock:
@@ -1209,6 +1223,34 @@ def read_local_score(path):
     if type(score) not in (int, float) or not math.isfinite(float(score)):
         return None
     return float(score)
+
+
+def parse_score_line(line):
+    """The score object a line version's evaluate printed last, or None:
+    ``{"score": <finite number>, "metrics": {<name>: <finite number>, ...}}``."""
+    try:
+        value = json.loads(line)
+    except (ValueError, UnicodeError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    score = value.get("score")
+    if type(score) not in (int, float) or not math.isfinite(float(score)):
+        return None
+    metrics = value.get("metrics", {})
+    if not isinstance(metrics, dict) or len(metrics) > 32:
+        return None
+    parsed = {}
+    for name, number in metrics.items():
+        if (
+            not isinstance(name, str)
+            or not METRIC_NAME.fullmatch(name)
+            or type(number) not in (int, float)
+            or not math.isfinite(float(number))
+        ):
+            return None
+        parsed[name] = float(number)
+    return float(score), parsed
 
 
 def write_runnability_report(report):
@@ -1259,7 +1301,7 @@ def validate_runnability_plan(encoded, base_commit):
         plan.get("schema_version") != 1
         or plan.get("repository_commit") != base_commit
         or not re.fullmatch(r"sha256:[a-f0-9]{64}", plan.get("image", ""))
-        or plan.get("scope") not in ("platform_shared", "user_private")
+        or plan.get("scope") not in ("platform_shared", "user_private", "line_version")
         or type(plan.get("gpu_required")) is not bool
         or type(plan.get("disk_mb")) is not int
         or not 64 <= plan["disk_mb"] <= 8192
@@ -1277,7 +1319,7 @@ def validate_runnability_plan(encoded, base_commit):
             or any(
                 not isinstance(item, str)
                 or not item
-                or len(item) > 256
+                or len(item) > COMMAND_ARGUMENT
                 or any(ord(char) < 32 for char in item)
                 for item in command
             )
@@ -1298,7 +1340,18 @@ def validate_runnability_plan(encoded, base_commit):
             or len(score_path) > 255
         ):
             raise SystemExit("Invalid runnability plan")
+        if step.get("score_stdout") not in (None, True) or (
+            step.get("score_stdout") and (step["level"] != "offline_loop" or score_path)
+        ):
+            raise SystemExit("Invalid runnability plan")
     if total > 3600:
+        raise SystemExit("Invalid runnability plan")
+    names = plan.get("env", [])
+    if (
+        not isinstance(names, list)
+        or len(names) > 64
+        or any(not isinstance(name, str) or not ENV_NAME.fullmatch(name) for name in names)
+    ):
         raise SystemExit("Invalid runnability plan")
     return plan
 
@@ -1333,14 +1386,22 @@ def run_runnability(encoded, base_commit):
             results.append(result)
             stopped = True
             continue
-        stdout, stderr = BoundedCapture(), BoundedCapture()
+        stdout = BoundedCapture(SCORE_TAIL if step.get("score_stdout") else 2000)
+        stderr = BoundedCapture()
         before = resource.getrusage(resource.RUSAGE_CHILDREN)
         started = time.monotonic()
         timed_out = False
         process = subprocess.Popen(
             step["command"],
             cwd=WORKSPACE,
-            env={"PATH": AGENT_PATH, "HOME": "/tmp", "PYTHONDONTWRITEBYTECODE": "1"},
+            # A line version's miner settings: exactly the variables the plan names, from
+            # this container's environment; the fixed ones always win.
+            env={
+                **{name: os.environ[name] for name in plan.get("env", []) if name in os.environ},
+                "PATH": AGENT_PATH,
+                "HOME": "/tmp",
+                "PYTHONDONTWRITEBYTECODE": "1",
+            },
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1389,6 +1450,10 @@ def run_runnability(encoded, base_commit):
             score = read_local_score(step["score_path"])
             if score is not None:
                 result["local_score"] = score
+        if status == "succeeded" and step.get("score_stdout"):
+            parsed = parse_score_line(stdout.last_line())
+            if parsed is not None:
+                result["local_score"], result["local_metrics"] = parsed
         results.append(result)
         stopped = status != "succeeded"
     incomplete = next((item for item in results if item["status"] != "succeeded"), None)
