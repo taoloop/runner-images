@@ -20,15 +20,29 @@ class HistoryError(Exception):
     pass
 
 
-# .taoloop/ is runner-private except a subnet starter's manifest and agent definitions
-# (ADR 021), which a coding task must be able to publish.
-PUBLISHED = re.compile(r"\.taoloop/(?:starter\.json|agents/[A-Za-z0-9_-]{1,64}\.md)")
+# .taoloop/ is runner-private except what a coding task must be able to publish: a subnet
+# starter's manifest and agent definitions (ADR 021), a shared miner line's manifest, and each
+# track's manifest and agent overrides under tracks/<track>/.taoloop/ (ADR 023).
+AGENT = r"agents/[A-Za-z0-9_-]{1,64}\.md"
+TRACK = r"tracks/[a-z][a-z0-9-]{0,39}/"
+PUBLISHED = re.compile(
+    rf"\.taoloop/(?:starter\.json|line\.json|{AGENT})|{TRACK}\.taoloop/(?:track\.json|{AGENT})"
+)
+TRACK_FOLDER = re.compile(TRACK)
 
 
-def published_entry(path, entry):
-    """Inside .taoloop/: the entries to publish (True), to descend into (None for the agents
-    folder) or to leave private (False). A linked published path is refused."""
-    if path == ".taoloop/agents":
+def private_root(prefix):
+    """The .taoloop/ folder a walk prefix is inside, or None."""
+    if prefix.startswith(".taoloop/"):
+        return ".taoloop/"
+    match = re.match(rf"{TRACK}\.taoloop/", prefix)
+    return match.group(0) if match else None
+
+
+def published_entry(path, entry, root=".taoloop/"):
+    """Inside a .taoloop/ folder: the entries to publish (True), to descend into (None for the
+    agents folder) or to leave private (False). A linked published path is refused."""
+    if path == root + "agents":
         if entry.is_symlink():
             raise HistoryError("Unsafe candidate path")
         return None if entry.is_dir(follow_symlinks=False) else False
@@ -44,13 +58,14 @@ def candidate_files(root):
         for entry in sorted(os.scandir(directory), key=lambda entry: entry.name):
             if not prefix and entry.name == ".git":
                 continue
-            if not prefix and entry.name == ".taoloop":
+            if entry.name == ".taoloop" and (not prefix or TRACK_FOLDER.fullmatch(prefix)):
                 if entry.is_dir(follow_symlinks=False):
-                    pending.append((Path(entry.path), ".taoloop/"))
+                    pending.append((Path(entry.path), prefix + ".taoloop/"))
                 continue
             path = prefix + entry.name
-            if prefix.startswith(".taoloop/"):
-                decision = published_entry(path, entry)
+            root = private_root(prefix)
+            if root is not None:
+                decision = published_entry(path, entry, root)
                 if decision is None:
                     pending.append((Path(entry.path), path + "/"))
                     continue
