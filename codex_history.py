@@ -137,6 +137,45 @@ def evaluation_candidates(files, preferred=None):
     return result
 
 
+VALUE_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
+VALUES_LIMIT = 8192
+
+
+def reported_values(workspace):
+    """The values the task reported for its owner's TaoLoop-provided miner settings, from
+    .taoloop/values.json: a JSON object of at most 32 setting names to plain values (strings
+    of at most 1000 characters). Returned with the result, never committed; anything
+    malformed, oversized or linked is ignored."""
+    try:
+        descriptor = os.open(
+            Path(workspace) / ".taoloop" / "values.json",
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+    except OSError:
+        return None
+    with os.fdopen(descriptor, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > VALUES_LIMIT:
+            return None
+        content = stream.read(VALUES_LIMIT + 1)
+    if len(content) > VALUES_LIMIT:
+        return None
+    try:
+        values = json.loads(content)
+    except ValueError:
+        return None
+    if not isinstance(values, dict) or len(values) > 32:
+        return None
+    for name, value in values.items():
+        if not VALUE_NAME.fullmatch(name) or name.startswith("TAOLOOP_"):
+            return None
+        if not isinstance(value, str | int | float | bool) or (
+            isinstance(value, str) and len(value) > 1000
+        ):
+            return None
+    return values
+
+
 def research_draft(content):
     if not 1 <= len(content) <= 8192:
         return None
@@ -278,6 +317,10 @@ def record(args, port, home):
     }
     if draft is not None:
         result["research_draft"] = draft
+    if args.values:
+        values = reported_values("/workspace")
+        if values:
+            result["values"] = values
     candidates = evaluation_candidates(file_metadata, args.candidate_path)
     if candidates:
         result["candidates"] = candidates
@@ -304,6 +347,7 @@ def main():
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--candidate-path", default=None)
     parser.add_argument("--research-draft", action="store_true")
+    parser.add_argument("--values", action="store_true")
     parser.add_argument("--netuid", type=int, required=True)
     args = parser.parse_args()
     if (
