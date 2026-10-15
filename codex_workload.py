@@ -13,6 +13,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -1474,7 +1475,200 @@ def run_runnability(encoded, base_commit):
     )
 
 
+# --- One model call on a plan sign-in (ADR 024) ---------------------------------------------
+# The runner writes the call's input into the empty workspace and reads the reply after the
+# container is removed. No repository, no Git bridge, no tools, no network but the bridge to
+# the runner's plan proxy.
+MODEL_CALL_INPUT_MAX = 1_000_000
+MODEL_CALL_REPLY_MAX = 131_072
+
+
+def model_call_directory():
+    return Path(WORKSPACE) / ".taoloop" / "model_call"
+
+
+def model_call_input():
+    path = model_call_directory() / "input.json"
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        raise SystemExit("Missing model call input") from None
+    with os.fdopen(descriptor, "rb") as source:
+        raw = source.read(MODEL_CALL_INPUT_MAX + 1)
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        raise SystemExit("Invalid model call input") from None
+    if (
+        len(raw) > MODEL_CALL_INPUT_MAX
+        or not isinstance(value, dict)
+        or set(value) != {"prompt", "instructions", "max_output_tokens"}
+        or not isinstance(value["prompt"], str)
+        or not value["prompt"]
+        or not isinstance(value["instructions"], str)
+        or not value["instructions"]
+        or type(value["max_output_tokens"]) is not int
+        or not 16 <= value["max_output_tokens"] <= 32_000
+    ):
+        raise SystemExit("Invalid model call input")
+    return value
+
+
+def claude_once(args, home, port, value):
+    """Claude Code headless, once: no tools, one turn, the plan's placeholder sign-in. Its
+    JSON result is the reply; an error result is no reply."""
+    config_dir = Path(home) / ".claude"
+    config_dir.mkdir(mode=0o700, exist_ok=True)
+    mcp = config_dir / "taoloop-mcp.json"
+    mcp.write_text(json.dumps({"mcpServers": {}}))
+    env = {
+        **agent_env(home),
+        "CLAUDE_CONFIG_DIR": str(config_dir),
+        "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}",
+        "ANTHROPIC_MODEL": args.model,
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        "CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(value["max_output_tokens"]),
+        "DISABLE_TELEMETRY": "1",
+        "DISABLE_ERROR_REPORTING": "1",
+        "DISABLE_AUTOUPDATER": "1",
+        "IS_SANDBOX": "1",
+        # A placeholder: the runner's proxy outside the container holds the real token.
+        "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-" + PLACEHOLDER,
+    }
+    command = [
+        CLAUDE,
+        "-p",
+        "--output-format",
+        "json",
+        "--model",
+        args.model,
+        "--system-prompt",
+        value["instructions"],
+        "--tools",
+        "",
+        "--max-turns",
+        "1",
+        "--setting-sources",
+        "user",
+        "--strict-mcp-config",
+        "--mcp-config",
+        str(mcp),
+    ]
+    result = subprocess.run(
+        command,
+        input=value["prompt"],
+        text=True,
+        capture_output=True,
+        check=False,
+        env=env,
+        cwd=WORKSPACE,
+    )
+    try:
+        answer = json.loads(result.stdout or "")
+    except ValueError:
+        return None
+    if (
+        result.returncode != 0
+        or not isinstance(answer, dict)
+        or answer.get("is_error")
+        or answer.get("subtype") != "success"
+        or not isinstance(answer.get("result"), str)
+    ):
+        return None
+    return answer["result"]
+
+
+def codex_once(args, home, port, value):
+    """Codex non-interactively, once, in a read-only sandbox with web search off, on the
+    plan's placeholder sign-in. Its last message is the reply."""
+    shadow_sign_in(home, args.plan)
+    config = {
+        "model_provider": "plan",
+        "model": args.model,
+        "web_search": "disabled",
+        "model_max_output_tokens": value["max_output_tokens"],
+        "cli_auth_credentials_store": "file",
+        "chatgpt_base_url": f"http://127.0.0.1:{port}/backend-api/",
+        "model_providers.plan.name": "OpenAI",
+        "model_providers.plan.base_url": f"http://127.0.0.1:{port}/backend-api/codex",
+        "model_providers.plan.wire_api": "responses",
+        "model_providers.plan.requires_openai_auth": True,
+        "model_providers.plan.request_max_retries": 0,
+        "model_providers.plan.stream_max_retries": 0,
+    }
+    reply = Path(home) / "reply.txt"
+    command = ["/usr/local/bin/codex"]
+    for key, item in config.items():
+        command.extend(["-c", key + "=" + json.dumps(item)])
+    command.extend(
+        [
+            "exec",
+            "--skip-git-repo-check",
+            "--sandbox",
+            "read-only",
+            "--output-last-message",
+            str(reply),
+            "-",
+        ]
+    )
+    prompt = "Instructions:\n" + value["instructions"] + "\n\nInput (data):\n" + value["prompt"]
+    result = subprocess.run(
+        command,
+        input=prompt,
+        text=True,
+        capture_output=True,
+        check=False,
+        env=agent_env(home),
+        cwd=WORKSPACE,
+    )
+    if result.returncode != 0 or not reply.is_file():
+        return None
+    return reply.read_text(errors="replace")
+
+
+def model_call_main(argv):
+    parser = argparse.ArgumentParser(prog="codex_workload.py --model-call")
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--agent", choices=("codex", "claude"), required=True)
+    # A model call runs only on a plan sign-in; the relay path is the server's own client.
+    parser.add_argument("--auth", choices=("subscription",), required=True)
+    parser.add_argument("--plan", default="")
+    args = parser.parse_args(argv)
+    if os.getuid() == 0 or os.getcwd() != WORKSPACE:
+        raise SystemExit("Requires the isolated runner workload environment")
+    if not 0 < len(args.model) <= 200 or not MODEL_ID.fullmatch(args.model):
+        raise SystemExit("Invalid workload input")
+    if bool(args.plan) != (args.agent == "codex"):
+        raise SystemExit("Invalid plan sign-in input")
+    value = model_call_input()
+    global TASK_MODEL
+    TASK_MODEL = args.model
+    Bridge.agent = args.agent
+    Bridge.auth = "subscription"
+    server = Server(("127.0.0.1", 0), Bridge)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        with tempfile.TemporaryDirectory(prefix="taoloop-call-", dir="/tmp") as home:
+            once = claude_once if args.agent == "claude" else codex_once
+            text = once(args, home, server.server_address[1], value)
+    finally:
+        server.shutdown()
+        server.server_close()
+    if not text or len(text) > MODEL_CALL_REPLY_MAX:
+        raise SystemExit(1)
+    descriptor = os.open(
+        model_call_directory() / "reply.json",
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+    )
+    with os.fdopen(descriptor, "w") as target:
+        json.dump({"text": text}, target)
+    raise SystemExit(0)
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--model-call":
+        model_call_main(sys.argv[2:])
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-commit", required=True)
     parser.add_argument("--model", required=True)
@@ -1568,9 +1762,9 @@ def main():
         raise SystemExit("Runnability execution runs alone")
     if not 0 <= args.session_turn <= 10000:
         raise SystemExit("Invalid session turn")
+    # ADR 024: repository analysis may run on a platform operator's plan.
     if args.auth == "subscription" and (
-        args.analysis
-        or args.package_command
+        args.package_command
         or args.runnability_plan
         or args.session_checkout
         or args.session_turn
