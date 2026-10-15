@@ -31,6 +31,14 @@ PUBLISHED = re.compile(
 TRACK_FOLDER = re.compile(TRACK)
 
 
+def kept_from_base(path):
+    """A baseline path the recorder keeps whatever the workspace holds: the runner's own
+    records under .taoloop/. Everything else, published .taoloop/ files included, is the
+    workspace's to keep or delete."""
+    text = path.decode("utf-8", "surrogateescape")
+    return text.startswith(".taoloop/") and not PUBLISHED.fullmatch(text)
+
+
 def private_root(prefix):
     """The .taoloop/ folder a walk prefix is inside, or None."""
     if prefix.startswith(".taoloop/"):
@@ -212,7 +220,7 @@ def record(args, port, home):
     # Rebuild candidate paths without interpreting its Git configuration,
     # attributes, hooks, index, ignore rules, or claimed HEAD. Keep trusted history.
     for path in tracked.split(b"\0"):
-        if path and not path.startswith(b".taoloop/"):
+        if path and not kept_from_base(path):
             git("update-index", "-z", "--index-info", body=b"0 " + b"0" * 40 + b"\t" + path + b"\0")
     hashes = {}
     file_metadata = {}
