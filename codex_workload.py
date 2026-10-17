@@ -908,6 +908,10 @@ def run_claude(args, home, port, toolkit, context, resume=None, prompt=None, ses
     if args.session_turn:
         # Claude Code 2.1: a caller-chosen conversation id, continued with --resume.
         command.extend(["--resume", resume] if resume else ["--session-id", session])
+        if getattr(args, "session_stream", False):
+            # ADR 025: one process for the whole leg; later messages join the running turn.
+            command.extend(["--input-format", "stream-json"])
+            return stream(command, prompt or args.objective, env, WORKSPACE)
         return tee(command, prompt or args.objective, env, WORKSPACE)
     return subprocess.run(
         command, input=prompt or args.objective, text=True, check=False, env=env, cwd=WORKSPACE
@@ -962,6 +966,74 @@ def tee(command, prompt, env, cwd):
     finally:
         output.close()
     return Teed(process.wait(), events, thread)
+
+
+STREAM_MESSAGE_CHARS = 20_000
+
+
+def user_line(text):
+    """One Claude Code stream-json user message line."""
+    return (
+        json.dumps(
+            {
+                "type": "user",
+                "message": {"role": "user", "content": text},
+                "parent_tool_use_id": None,
+            }
+        )
+        + "\n"
+    ).encode()
+
+
+def stream(command, prompt, env, cwd):
+    """Run Claude Code for a whole session leg (ADR 025): the first message, then every
+    message the runner writes to this container's stdin (one ``{"text": ...}`` line each),
+    passed to the running agent as a user line, so a message sent mid-turn joins that turn.
+    Its JSON events pass through to stdout unchanged, as ``tee`` does. Closing the
+    container's stdin ends the leg: the agent finishes its turn and exits."""
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        env=env,
+        cwd=cwd,
+    )
+
+    def forward():
+        try:
+            process.stdin.write(user_line(prompt))
+            process.stdin.flush()
+            for raw in sys.stdin:
+                try:
+                    value = json.loads(raw)
+                except ValueError:
+                    continue
+                text = value.get("text") if isinstance(value, dict) else None
+                if not isinstance(text, str) or not text.strip():
+                    continue
+                process.stdin.write(user_line(text[:STREAM_MESSAGE_CHARS]))
+                process.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+        finally:
+            try:
+                process.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+
+    writer = threading.Thread(target=forward, daemon=True)
+    writer.start()
+    events = 0
+    output = os.fdopen(os.dup(1), "wb", buffering=0)
+    try:
+        for line in process.stdout:
+            output.write(line)
+            if line.strip().startswith(b"{"):
+                events += 1
+    finally:
+        output.close()
+    writer.join(5)
+    return Teed(process.wait(), events, None)
 
 
 def session_home():
@@ -1687,6 +1759,9 @@ def main():
     parser.add_argument("--session-turn", type=int, default=0)
     parser.add_argument("--session-id", default="")
     parser.add_argument("--transcript", default="")
+    # ADR 025: one Claude Code process for a whole session leg; the runner writes later
+    # messages to this container's stdin and they join the running turn.
+    parser.add_argument("--session-stream", action="store_true")
     # Repository analysis (ADR 009): base64 JSON with the mode, commits, previous map and
     # result schema; the checkout is a public upstream and nothing is published.
     parser.add_argument("--analysis", default="")
@@ -1724,6 +1799,8 @@ def main():
         raise SystemExit("A kept agent home belongs to a coding step")
     if args.continue_mode and not args.keep_home:
         raise SystemExit("A continuation requires the kept agent home")
+    if args.session_stream and (not args.session_turn or args.agent != "claude"):
+        raise SystemExit("A stream session is a Claude Code session turn")
     if not re.fullmatch(r"[a-f0-9]{40}", args.base_commit):
         raise SystemExit("Invalid task baseline")
     # The runner appends research, reward, evaluation and outcome context to the task's
@@ -1764,10 +1841,7 @@ def main():
         raise SystemExit("Invalid session turn")
     # ADR 024: repository analysis may run on a platform operator's plan.
     if args.auth == "subscription" and (
-        args.package_command
-        or args.runnability_plan
-        or args.session_checkout
-        or args.session_turn
+        args.package_command or args.runnability_plan or args.session_checkout or args.session_turn
     ):
         raise SystemExit("A plan sign-in serves coding tasks only")
     if bool(args.plan) != (args.auth == "subscription" and args.agent == "codex"):
