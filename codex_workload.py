@@ -1145,7 +1145,17 @@ def codex_stream(command, prompt, env, cwd, resume=None):
                 failed = "error" in message
                 result = message.get("result") or {}
                 with lock:
-                    if method == "initialize":
+                    if method in ("initialize", "thread/start") and failed:
+                        # No thread to work in: the leg's message is answered with an error
+                        # and the app-server let go, instead of waiting for the turn timeout.
+                        emit({"type": "user", "isReplay": True})
+                        emit({"type": "result", "subtype": "error"})
+                        state["eof"] = True
+                        try:
+                            process.stdin.close()
+                        except (BrokenPipeError, OSError):
+                            pass
+                    elif method == "initialize":
                         send("initialized", notice=True)
                         if resume:
                             send("thread/resume", {"threadId": resume})
@@ -1166,6 +1176,8 @@ def codex_stream(command, prompt, env, cwd, resume=None):
                         state["starting"] = False
                         state["turn"] = None if failed else (result.get("turn") or {}).get("id")
                         if failed:
+                            # The message was taken (it failed): count it so the turn closes.
+                            emit({"type": "user", "isReplay": True})
                             emit({"type": "result", "subtype": "error"})
                     elif method == "turn/steer" and failed and text is not None:
                         waiting.insert(0, text)  # the turn had just ended: start a new one
@@ -1355,6 +1367,13 @@ def run_session_turn(args, home, port, toolkit, context):
         else:
             identity = resume or args.session_id
             result = run_claude(args, home, port, toolkit, context, resume=resume, session=identity)
+            if result.returncode != 0 and result.events == 0 and resume is None:
+                # The conversation id may already exist (a turn was cut off after Claude Code
+                # created it but before its state was saved): resume it instead (ADR 025).
+                resume = identity
+                result = run_claude(
+                    args, home, port, toolkit, context, resume=resume, session=identity
+                )
             if result.returncode != 0 and result.events == 0 and resume is not None:
                 identity = str(uuid.uuid4())
                 prompt = replay_prompt(transcript, args.objective)
