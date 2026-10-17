@@ -910,7 +910,9 @@ def run_claude(args, home, port, toolkit, context, resume=None, prompt=None, ses
         command.extend(["--resume", resume] if resume else ["--session-id", session])
         if getattr(args, "session_stream", False):
             # ADR 025: one process for the whole leg; later messages join the running turn.
-            command.extend(["--input-format", "stream-json"])
+            # Every message the agent consumes is echoed back, so the runner can tell when
+            # all the messages it wrote have been answered and the leg's turn is over.
+            command.extend(["--input-format", "stream-json", "--replay-user-messages"])
             return stream(command, prompt or args.objective, env, WORKSPACE)
         return tee(command, prompt or args.objective, env, WORKSPACE)
     return subprocess.run(
