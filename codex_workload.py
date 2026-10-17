@@ -829,6 +829,12 @@ def run_codex(args, home, port, toolkit, context, resume=None, prompt=None):
     if toolkit or context:
         for key, value in apply_toolkit(home, toolkit, "codex", context):
             command.extend(["-c", key + "=" + json.dumps(value)])
+    env = agent_env(home)
+    if args.auth != "subscription":
+        env["TAOLOOP_PROXY_PLACEHOLDER"] = "local-only"
+    if getattr(args, "session_stream", False):
+        # ADR 025: one app-server for the whole leg; later messages steer the running turn.
+        return codex_stream([*command, "app-server"], prompt or args.objective, env, None, resume)
     command.extend(["exec", *(["resume", resume] if resume else [])])
     command.extend(
         [
@@ -838,9 +844,6 @@ def run_codex(args, home, port, toolkit, context, resume=None, prompt=None):
             "-",
         ]
     )
-    env = agent_env(home)
-    if args.auth != "subscription":
-        env["TAOLOOP_PROXY_PLACEHOLDER"] = "local-only"
     if args.session_turn or args.keep_home:
         return tee(command, prompt or args.objective, env, None)
     return subprocess.run(command, input=args.objective, text=True, check=False, env=env)
@@ -1036,6 +1039,157 @@ def stream(command, prompt, env, cwd):
         output.close()
     writer.join(5)
     return Teed(process.wait(), events, None)
+
+
+def codex_stream(command, prompt, env, cwd, resume=None):
+    """Run ``codex app-server`` for a whole session leg (ADR 025): the first message starts a
+    turn; each later message the runner writes to this container's stdin is steered into the
+    running turn (``turn/steer``), or starts the next turn when none runs. App-server
+    notifications pass through to stdout; beside them it prints the two markers the runner
+    follows: ``{"type":"user","isReplay":true}`` for each message Codex took in, and
+    ``{"type":"result"}`` when a turn completes. Closing stdin ends the leg after its turn."""
+    process = subprocess.Popen(
+        command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env, cwd=cwd
+    )
+    lock = threading.RLock()
+    state = {"next": 0, "thread": None, "turn": None, "starting": False, "eof": False}
+    pending = {}
+    waiting = []
+    output = os.fdopen(os.dup(1), "wb", buffering=0)
+
+    def emit(event):
+        output.write((json.dumps(event) + "\n").encode())
+
+    def send(method, params=None, *, notice=False, text=None):
+        with lock:
+            message = {"jsonrpc": "2.0", "method": method}
+            if not notice:
+                state["next"] += 1
+                message["id"] = state["next"]
+                pending[state["next"]] = (method, text)
+            if params is not None:
+                message["params"] = params
+            try:
+                process.stdin.write((json.dumps(message) + "\n").encode())
+                process.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+
+    def text_input(text):
+        return [{"type": "text", "text": text[:STREAM_MESSAGE_CHARS]}]
+
+    def start(text):
+        state["starting"] = True
+        send("turn/start", {"threadId": state["thread"], "input": text_input(text)}, text=text)
+
+    def deliver(text):
+        with lock:
+            if state["thread"] is None or state["starting"]:
+                waiting.append(text)
+            elif state["turn"] is not None:
+                send(
+                    "turn/steer",
+                    {
+                        "threadId": state["thread"],
+                        "expectedTurnId": state["turn"],
+                        "input": text_input(text),
+                    },
+                    text=text,
+                )
+            else:
+                start(text)
+
+    def settle():
+        """Start the next waiting message, or end the leg once stdin closed and all is done."""
+        with lock:
+            if state["starting"] or state["turn"] is not None or state["thread"] is None:
+                return
+            if waiting:
+                start(waiting.pop(0))
+            elif state["eof"]:
+                try:
+                    process.stdin.close()
+                except (BrokenPipeError, OSError):
+                    pass
+
+    def forward():
+        for raw in sys.stdin:
+            try:
+                value = json.loads(raw)
+            except ValueError:
+                continue
+            text = value.get("text") if isinstance(value, dict) else None
+            if isinstance(text, str) and text.strip():
+                deliver(text)
+        with lock:
+            state["eof"] = True
+        settle()
+
+    send("initialize", {"clientInfo": {"name": "taoloop", "version": "1"}})
+    # Messages read before the thread and its first turn exist wait for them.
+    threading.Thread(target=forward, daemon=True).start()
+    events = 0
+    try:
+        for line in process.stdout:
+            output.write(line)
+            try:
+                message = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(message, dict):
+                continue
+            events += 1
+            ident = message.get("id")
+            if ident in pending and "method" not in message:
+                method, text = pending.pop(ident)
+                failed = "error" in message
+                result = message.get("result") or {}
+                with lock:
+                    if method == "initialize":
+                        send("initialized", notice=True)
+                        if resume:
+                            send("thread/resume", {"threadId": resume})
+                        else:
+                            send(
+                                "thread/start",
+                                {"approvalPolicy": "never", "sandbox": "danger-full-access"},
+                            )
+                    elif method == "thread/resume" and failed:
+                        send(
+                            "thread/start",
+                            {"approvalPolicy": "never", "sandbox": "danger-full-access"},
+                        )
+                    elif method in ("thread/start", "thread/resume") and not failed:
+                        state["thread"] = (result.get("thread") or {}).get("id") or resume
+                        start(prompt)
+                    elif method == "turn/start":
+                        state["starting"] = False
+                        state["turn"] = None if failed else (result.get("turn") or {}).get("id")
+                        if failed:
+                            emit({"type": "result", "subtype": "error"})
+                    elif method == "turn/steer" and failed and text is not None:
+                        waiting.insert(0, text)  # the turn had just ended: start a new one
+                if method in ("turn/start", "turn/steer"):
+                    if method == "turn/start" and not failed:
+                        while waiting and state["turn"] is not None:
+                            deliver(waiting.pop(0))
+                    settle()
+                continue
+            method = message.get("method")
+            params = message.get("params") or {}
+            if (
+                method == "item/completed"
+                and (params.get("item") or {}).get("type") == "userMessage"
+            ):
+                emit({"type": "user", "isReplay": True})
+            elif method == "turn/completed":
+                with lock:
+                    state["turn"] = None
+                emit({"type": "result", "subtype": "success"})
+                settle()
+    finally:
+        output.close()
+    return Teed(process.wait(), events, state["thread"])
 
 
 def session_home():
@@ -1802,8 +1956,8 @@ def main():
         raise SystemExit("A kept agent home belongs to a coding step")
     if args.continue_mode and not args.keep_home:
         raise SystemExit("A continuation requires the kept agent home")
-    if args.session_stream and (not args.session_turn or args.agent != "claude"):
-        raise SystemExit("A stream session is a Claude Code session turn")
+    if args.session_stream and not args.session_turn:
+        raise SystemExit("A stream session is a session turn")
     if not re.fullmatch(r"[a-f0-9]{40}", args.base_commit):
         raise SystemExit("Invalid task baseline")
     # The runner appends research, reward, evaluation and outcome context to the task's
