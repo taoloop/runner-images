@@ -1192,8 +1192,9 @@ def run_session_turn(args, home, port, toolkit, context):
     if args.agent == "claude":
         if not UUID_PATTERN.match(args.session_id or ""):
             raise SystemExit("Claude Code sessions need a conversation id")
-        if resume is None and args.session_turn > 1:
-            # No recorded conversation for a later turn: start one primed with the transcript.
+        if resume is None and (args.session_turn > 1 or transcript):
+            # No recorded conversation for a later turn, or for a conversation's new leg on a
+            # host without its home (ADR 025): start one primed with the transcript.
             identity = str(uuid.uuid4())
             prompt = replay_prompt(transcript, args.objective) if transcript else None
             result = run_claude(args, home, port, toolkit, context, prompt=prompt, session=identity)
@@ -1209,7 +1210,7 @@ def run_session_turn(args, home, port, toolkit, context):
         if result.events:
             save_session_state(home, "claude", identity)
         return result
-    if resume is None and args.session_turn > 1:
+    if resume is None and (args.session_turn > 1 or transcript):
         prompt = replay_prompt(transcript, args.objective) if transcript else None
         result = run_codex(args, home, port, toolkit, context, prompt=prompt)
     else:
